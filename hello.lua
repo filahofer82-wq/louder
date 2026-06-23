@@ -415,7 +415,146 @@ events.render:set(function()
 end)
 
 -- ============================================================
--- Tab B: SSG-08 config manager (ported from 67_6803707.lua).
+-- Tab B (group 2): Fake AA debug overlay (ported from fakeaa test).
+-- Reads the angles the anti-aim actually sends (createmove) and draws
+-- them as a draggable HUD. Drag with LEFT CLICK while the menu is open.
+-- ============================================================
+local aa_grp     = ui.create('B', 'Anti-aim debug')
+local aa_enabled = aa_grp:switch('Enabled', false)
+
+-- small HUD font (falls back to default preset if it can't load)
+local aa_hud_font = 1
+pcall(function() aa_hud_font = render.load_font('Verdana', 11, 'a') end)
+
+-- latest angles the anti-aim actually sent (captured in createmove)
+local aa_sent = { yaw = 0, pitch = 0, roll = 0 }
+
+events.createmove:set(function(cmd)
+    pcall(function() aa_sent.pitch = cmd.view_angles.x end)
+    pcall(function() aa_sent.yaw   = cmd.view_angles.y end)
+    pcall(function() aa_sent.roll  = cmd.view_angles.z end)
+end)
+
+-- draggable position (right edge x, top y) - persisted in db
+local aa_pos = { x = nil, y = nil }
+pcall(function()
+    aa_pos.x = db.fakeaa_dbg_x
+    aa_pos.y = db.fakeaa_dbg_y
+end)
+
+local aa_drag     = { active = false, off = vector(0, 0) }
+local aa_hovering = false   -- updated in render, read by mouse_input
+
+-- block the menu from reacting to the click while we grab the text
+events.mouse_input:set(function()
+    if not aa_enabled:get() then return end
+    local alpha = 0
+    pcall(function() alpha = ui.get_alpha() or 0 end)
+    if alpha > 0 and (aa_hovering or aa_drag.active) then
+        return false
+    end
+end)
+
+events.render:set(function()
+    if not aa_enabled:get() then return end
+
+    -- only while alive: hide when dead / spectating / in the main menu.
+    local lp = entity.get_local_player()
+    if not lp then return end
+    local alive = false
+    pcall(function() alive = lp:is_alive() end)
+    if not alive then return end
+
+    local eye_y, choked
+    pcall(function() eye_y = lp.m_angEyeAngles.y end)
+    pcall(function() choked = globals.choked_commands end)
+
+    local function f(v) return v and string.format('%.1f', v) or 'nil' end
+
+    -- number on the left, label text on the right
+    local rows = {
+        { f(aa_sent.yaw),   'sent yaw' },
+        { f(aa_sent.pitch), 'sent pitch' },
+        { f(aa_sent.roll),  'sent roll' },
+        { f(eye_y),         'eye yaw' },
+    }
+    if choked ~= nil and choked > 1 then
+        rows[#rows + 1] = { tostring(choked), 'choked cmds' }
+    end
+
+    -- pre-measure each line and find the widest
+    local line_h = 12
+    local maxw   = 0
+    local items  = {}
+    for i, r in ipairs(rows) do
+        local txt = r[1] .. '   ' .. r[2]
+        local tw = 0
+        pcall(function() tw = render.measure_text(aa_hud_font, nil, txt).x end)
+        items[i] = { txt = txt, w = tw }
+        if tw > maxw then maxw = tw end
+    end
+    local block_h = #rows * line_h
+
+    local screen = render.screen_size()
+    -- first-run default: right edge, vertically centered
+    if aa_pos.x == nil then aa_pos.x = screen.x - 4 end
+    if aa_pos.y == nil then aa_pos.y = screen.y / 2 - block_h / 2 end
+
+    -- ---- drag handling (only while menu is open) ----
+    local alpha = 0
+    pcall(function() alpha = ui.get_alpha() or 0 end)
+
+    aa_hovering = false
+    if alpha > 0 then
+        local mouse
+        pcall(function() mouse = ui.get_mouse_position() end)
+        local btn = false
+        pcall(function() btn = common.is_button_down(1) end)
+
+        if mouse then
+            local left = aa_pos.x - maxw
+            if mouse.x >= left and mouse.x <= aa_pos.x
+            and mouse.y >= aa_pos.y and mouse.y <= aa_pos.y + block_h then
+                aa_hovering = true
+            end
+
+            if aa_hovering and btn and not aa_drag.active then
+                aa_drag.active = true
+                aa_drag.off = vector(aa_pos.x - mouse.x, aa_pos.y - mouse.y)
+            end
+            if not btn then aa_drag.active = false end
+
+            if aa_drag.active then
+                -- vertical movement only (X stays locked to the edge)
+                aa_pos.y = math.clamp(mouse.y + aa_drag.off.y, 0, screen.y - block_h)
+                db.fakeaa_dbg_y = aa_pos.y
+            end
+        end
+    else
+        aa_drag.active = false
+    end
+
+    -- ---- draw ----
+    local y = aa_pos.y
+    for _, it in ipairs(items) do
+        render.text(aa_hud_font, vector(aa_pos.x - it.w, y),
+            color(255, 255, 255, 255), nil, it.txt)
+        y = y + line_h
+    end
+
+    -- grab outline when the menu is open and you're on the text
+    if alpha > 0 and (aa_hovering or aa_drag.active) then
+        pcall(function()
+            render.rect_outline(
+                vector(aa_pos.x - maxw - 4, aa_pos.y - 4),
+                vector(aa_pos.x + 4, aa_pos.y + block_h + 4),
+                color(255, 255, 255, 120), 1, 4)
+        end)
+    end
+end)
+
+-- ============================================================
+-- Tab C: SSG-08 config manager (ported from 67_6803707.lua).
 -- Saves/loads named snapshots of the SSG-08 Ragebot settings.
 -- ============================================================
 local SCOUT_DB_KEY      = 'scout_ssg08_configs'
