@@ -261,6 +261,11 @@ local function sel_index()
     return nil
 end
 
+-- Movement group -- CREATED HERE (right after Selection) so it sits directly
+-- under Selection in the LEFT column. It's populated further down (search
+-- "misc_grp:switch") -- only the creation moved up here.
+local misc_grp = ui.create(TAB_B, 'Movement', 1)
+
 -- Rage tab placeholder (shown only when "Rage" is selected; see tab driver).
 local rage_grp  = ui.create(TAB_B, 'Rage', 2)
 local rage_soon = rage_grp:label(menu_accent(ui.get_icon('hourglass-half')) .. ' Coming soon...')
@@ -488,7 +493,9 @@ end)
 -- Reads the angles the anti-aim actually sends (createmove) and draws
 -- them as a draggable HUD. Drag with LEFT CLICK while the menu is open.
 -- ============================================================
-local aa_grp     = ui.create(TAB_B, 'Visuals', 1)
+-- Visuals -> column 2 (RIGHT), created after Notifications so it stacks
+-- directly UNDER the Notifications group.
+local aa_grp     = ui.create(TAB_B, 'Visuals', 2)
 local aa_enabled = aa_grp:switch(menu_accent(ui.get_icon('magnifying-glass')) .. ' Debug Anti-aim', false)
 
 -- small HUD font (falls back to default preset if it can't load)
@@ -669,26 +676,10 @@ events.render:set(function()
 end)
 
 -- ============================================================
--- Tab B: Animations (ported from the Fake AA script). Shown under the
--- "Misc" selection. Leg / pose-parameter animation breaker; modifies the
--- local player's clientside animation in post_update_clientside_animation.
+-- Shared animation FFI plumbing (used by Player Animations below). The
+-- animation-layer array lives at offset 10640 off the entity; an_set_leg
+-- overrides the real "Leg Movement" anti-aim option.
 -- ============================================================
-local an_grp    = ui.create(TAB_B, 'Animations', 1)
--- value -> name maps; the slider tooltip function shows these instead of numbers.
-local AN_GROUND = { [0] = 'Off', [1] = 'Jitter', [2] = 'Alternative Jitter', [3] = 'Allah' }
--- In Air slider: Off, 1-100x (Static intensity), then Jitter (101) and Allah (102).
-local function an_air_label(v)
-    if v == 0 then return 'Off'
-    elseif v <= 100 then return v .. 'x'
-    elseif v == 101 then return 'Jitter'
-    elseif v == 102 then return 'Allah' end
-    return tostring(v)
-end
--- controls live directly in the group now (not behind the switch's gear popup).
-local an_ground = an_grp:slider('On Ground', 0, 3, 0, 1, function(v) return AN_GROUND[v] or tostring(v) end)
-local an_air    = an_grp:slider('In Air', 0, 102, 0, 1, function(v) return an_air_label(v) end)
-local an_bodylean = an_grp:slider('Body Lean', 0, 100, 0, 1, function(v) return v == 0 and 'Off' or (tostring(v) .. 'x') end)
-
 local an_ffi = require('ffi')
 local an = {
     char_ptr           = an_ffi.typeof('char*'),
@@ -705,71 +696,227 @@ local function an_set_leg(v)
     if an_leg then pcall(function() an_leg:override(v) end) end
 end
 
--- listable:get() returns an array of checked 1-based indices
-local function an_has(t, idx)
-    if type(t) ~= 'table' then return false end
-    for _, v in pairs(t) do if v == idx then return true end end
-    return false
-end
+-- ============================================================
+-- Tab B: Player Animations (ported from Nyanza Snapshot).  Shown under
+-- the "Misc" selection. Pose-parameter / animation-layer breaker with
+-- optional exponential smoothing ("Interpolating"). Uses the FFI layer
+-- path (an.*) and an_set_leg() helper above.
+-- ============================================================
+local pa_grp = ui.create(TAB_B, 'Animations', 1)
 
--- (On Ground / In Air are sliders now -> no single-select enforcement needed.)
+-- Icons (FontAwesome via ui.get_icon, tinted with the menu accent). Nyanza's
+-- own labels used its private icon font (\v..\r) which won't render here, so
+-- these are close FA equivalents -- swap the names to taste.
+local PA_I_INTERP = menu_accent(ui.get_icon('seedling'))         .. '  '
+local PA_I_LEAN   = menu_accent(ui.get_icon('layer-group'))       .. '  '
+local PA_I_FALL   = menu_accent(ui.get_icon('person-falling'))   .. '  '
+local PA_I_WALK   = menu_accent(ui.get_icon('person-walking'))   .. '  '
 
--- self-contained on-ground state (Emberlash used its v16.ticks engine)
-local an_ticks         = 0
-local an_ground_tick   = false
-local an_is_on_ground  = false
+-- Interpolating: 0 Default, 9 Medium, 14 High, else "<n>t" (smoothing ticks).
+local pa_interp = pa_grp:slider(PA_I_INTERP .. 'Interpolating', 0, 14, 0, 1, function(v)
+    if v == 0 then return 'Default'
+    elseif v == 4 then return 'Low'
+    elseif v == 9 then return 'High'
+    elseif v == 14 then return 'Max' end
+    return v .. 't'
+end)
+
+-- Leaning: tilt the local player's model (animation layer 12 weight).
+local pa_lean = pa_grp:slider(PA_I_LEAN .. 'Leaning', 0, 100, 0, 0.01, function(v)
+    if v == 0 then return 'Off' end
+    return v .. 'x'
+end)
+
+-- Falling: suppress the jump animation, leaving mostly the falling pose.
+local pa_fall = pa_grp:slider(PA_I_FALL .. 'Falling', 0, 10, 0, 0.1, function(v)
+    if v == 0 then return 'Off'
+    elseif v == 5 then return 'GS'
+    else return v .. 'x' end
+end)
+
+-- Walking: Off, Force (always walk anim), Jitter (slide walk) -- a combo like
+-- the Notifications "Style" dropdown.
+local pa_walk = pa_grp:combo(PA_I_WALK .. 'Walking', 'Disabled', 'Force', 'Jitter')
+
+-- per-index exponential-moving-average state for the Interpolating smoother.
+local pa_sm_pose, pa_sm_layers = {}, {}
+for i = 0, 12 do pa_sm_pose[i] = 0; pa_sm_layers[i] = 0 end
 
 events.post_update_clientside_animation:set(function()
     local lp = entity.get_local_player()
-    if not lp or not lp:is_alive() then an_set_leg(); return end
-
-    -- consecutive on-ground frames (drives ground/air branch + landing window)
-    local on_ground_now = false
-    pcall(function() on_ground_now = lp.m_hGroundEntity ~= nil end)
-    an_ticks        = on_ground_now and (an_ticks + 1) or 0
-    an_ground_tick  = an_is_on_ground
-    an_is_on_ground = an_ticks > 8
+    if not lp or not lp:is_alive() then return end
 
     pcall(function()
-        an_set_leg()  -- clear the leg override; branches below re-set it when active
         local cls = an_ffi.cast(an.class_ptr, an.get_entity_address(lp:get_index()))
         if cls == an.nullptr then return end
         local layers = an_ffi.cast(an.animation_layer_t, an_ffi.cast(an.char_ptr, cls) + 10640)[0]
 
-        local speed = lp.m_vecVelocity:length2d()
-        local g = an_ground:get()   -- 0 Off / 1 Jitter / 2 Alternative Jitter / 3 Allah
-        local a = an_air:get()      -- 0 Off / 1-100 Static(x) / 101 Jitter / 102 Allah
+        local speed = lp.m_vecVelocity:length()
 
-        if an_ground_tick and speed > 1.5 then
-            if g == 1 then            -- Jitter
-                lp.m_flPoseParameter[7] = utils.random_float(0, 1)
-                an_set_leg('Walking')
-            elseif g == 2 then        -- Alternative Jitter
-                local slide = globals.tickcount % 4 > 1
-                lp.m_flPoseParameter[0] = slide and 0.5 or 1
-                an_set_leg(slide and 'Sliding' or 'Default')
-            elseif g == 3 then        -- Allah
+        -- Leaning -> animation layer 12 weight (while moving).
+        local lean = pa_lean:get()
+        if lean ~= 0 and speed > 3 then
+            layers[12].weight = lean / 100
+        end
+
+        -- Falling -> pose param 6.
+        local fall = pa_fall:get()
+        if fall ~= 0 then lp.m_flPoseParameter[6] = fall / 10 end
+
+        -- Walking -> Leg Movement override (only when active; leaves the other
+        -- Animations group's leg override alone when this is off).
+        local walk = pa_walk:get()
+        if walk == 'Force' or walk == 2 then
+            an_set_leg('Walking')
+            lp.m_flPoseParameter[7] = 0
+        elseif walk == 'Jitter' or walk == 3 then
+            an_set_leg('Sliding')
+            if globals.tickcount % 4 > 1 then
+                lp.m_flPoseParameter[0] = 1
+                lp.m_flPoseParameter[1] = 1
                 lp.m_flPoseParameter[7] = 1
-                an_set_leg('Walking')
-            end
-        elseif not an_ground_tick and speed > 1.5 then
-            if a >= 1 and a <= 100 then    -- Static (configurable intensity, 1-100x)
-                lp.m_flPoseParameter[6] = a / 100
-                an_set_leg('Sliding')
-            elseif a == 101 then           -- Jitter
-                lp.m_flPoseParameter[6] = utils.random_float(0, 1)
-                an_set_leg('Walking')
-            elseif a == 102 then           -- Allah
-                layers[6].weight = 1
             end
         end
 
-        -- Body Lean (0 = Off, 1-100). Steep curve so low values lean strongly.
-        local bl = an_bodylean:get()
-        if bl > 0 and speed > 1.5 then
-            layers[12].weight = (bl / 100) ^ 0.3
+        -- Interpolating -> exponential smoothing of every pose param + layer.
+        local interp = pa_interp:get()
+        if interp > 0 then
+            local t = globals.tickinterval * interp
+            for i = 0, 12 do
+                pa_sm_pose[i] = t * pa_sm_pose[i] + (1 - t) * lp.m_flPoseParameter[i]
+                lp.m_flPoseParameter[i] = pa_sm_pose[i]
+            end
+            for i = 0, 12 do
+                pa_sm_layers[i] = t * pa_sm_layers[i] + (1 - t) * layers[i].weight
+                layers[i].weight = pa_sm_layers[i]
+            end
         end
     end)
+end)
+
+-- ============================================================
+-- Tab B: Movement (Fast Ladder, ported from arch). Shown under the "Misc"
+-- selection. Abuses the ladder movement mechanic to climb a bit faster:
+-- while on a ladder and only pressing forward/back, it remaps the move
+-- inputs perpendicular to the ladder and snaps the view to climb angle.
+-- (misc_grp is created earlier, right under Selection -- only populated here.)
+-- ============================================================
+local ml_ladder = misc_grp:switch(menu_accent(ui.get_icon('angles-up')) .. '  Fast Ladder', false)
+pcall(function()
+    ml_ladder:tooltip('\194\183 Abuses the ladder movement mechanic and makes you move a little faster.')
+end)
+
+events.createmove:set(function(cmd)
+    if not ml_ladder:get() then return end
+    pcall(function()
+        -- only when purely forward/back (no strafe input)
+        if cmd.sidemove ~= 0 or cmd.forwardmove == 0 then return end
+        local lp = entity.get_local_player()
+        if not lp or not lp:is_alive() then return end
+        -- 9 = MOVETYPE_LADDER; skip if not on a ladder or standing on ground
+        if lp.m_MoveType ~= 9 or bit.band(lp.m_fFlags, 1) == 1 then return end
+        local weapon = lp:get_player_weapon()
+        if weapon == nil then return end
+        local throw = weapon.m_fThrowTime          -- mid-grenade-throw -> skip
+        if throw ~= nil and throw > 0 then return end
+
+        local ladder_normal = lp.m_vecLadderNormal
+        if ladder_normal:normalize() == 0 then return end   -- normalises in place
+        local va  = cmd.view_angles
+        local nrm = ladder_normal:angles()
+        local fwd = cmd.forwardmove > 0
+        local left_side = math.normalize_yaw(va.y - nrm.y) <= 0
+        if va.x - nrm.x > 45 then fwd = not fwd end          -- looking up the ladder
+
+        cmd.in_back    = fwd and 1 or 0
+        cmd.in_forward = fwd and 0 or 1
+        if left_side then
+            cmd.in_moveleft  = fwd and 1 or 0
+            cmd.in_moveright = fwd and 0 or 1
+        else
+            cmd.in_moveleft  = fwd and 0 or 1
+            cmd.in_moveright = fwd and 1 or 0
+        end
+        va.x = 89
+        va.y = nrm.y + (left_side and 90 or -90)
+    end)
+end)
+
+-- No Fall Damage (ported from arch). While airborne it predicts the landing:
+-- traces a hull straight down for ground, integrates gravity over the distance
+-- left, and on a lethal fall auto-ducks (resets the fall-damage accumulation)
+-- or -- at terminal velocity right above ground -- jumps to cancel the landing.
+local ml_nofall = misc_grp:switch(menu_accent(ui.get_icon('person-falling-burst')) .. '  No Fall Damage', false)
+pcall(function()
+    ml_nofall:tooltip('\194\183 Prevents fall damage by ducking / jumping at the right tick before landing.')
+end)
+
+local nfd_mins, nfd_maxs
+pcall(function()
+    nfd_mins = utils.get_vfunc(76, 'float*(__thiscall*)(void*)')   -- GetPlayerMins
+    nfd_maxs = utils.get_vfunc(77, 'float*(__thiscall*)(void*)')   -- GetPlayerMaxs
+end)
+
+-- hull trace straight down; true when solid ground (z-normal >= 0.7) is below.
+local function nfd_ground(ent, origin, dist)
+    local mins = nfd_mins(ent[0])
+    local maxs = nfd_maxs(ent[0])
+    mins = vector(mins[0], mins[1], mins[2])
+    maxs = vector(maxs[0], maxs[1], 54)
+    local tr = utils.trace_hull(origin, origin - vector(0, 0, dist), mins, maxs, ent, 1)
+    return tr.fraction < 1 and not tr.start_solid and not tr.all_solid
+        and tr.plane.normal.z >= 0.7, tr
+end
+
+-- integrate gravity over the remaining distance; lethal if it lands fast enough.
+local function nfd_lethal(dist, vz)
+    local ti    = globals.tickinterval
+    local halfg = cvar.sv_gravity:float() * ti * 0.5
+    local d, v  = dist, vz
+    while d > 11 do
+        v = v - halfg
+        d = d + ti * v
+        v = v - halfg
+    end
+    return v <= -580 and d >= 9
+end
+
+events.createmove:set(function(cmd)
+    if not ml_nofall:get() then return end
+    if not (nfd_mins and nfd_maxs) then return end
+    pcall(function()
+        local lp = entity.get_local_player()
+        if not lp or not lp:is_alive() then return end
+        local on_ground = bit.band(lp.m_fFlags, 1) == 1
+        if lp.m_MoveType ~= 2 or on_ground then return end       -- 2 = MOVETYPE_WALK
+        local origin = lp:get_origin()
+        if bit.band(lp.m_fFlags, 2) == 0 then origin.z = origin.z + 9 end  -- not ducking
+        local hit, tr = nfd_ground(lp, origin, 1000)
+        if not hit then return end
+        local dist = tr.fraction * 1000
+        local vz   = lp.m_vecVelocity.z
+        if vz >= 0 or dist >= 11 then
+            if nfd_lethal(dist, vz) then
+                cmd.in_duck = 1
+                cmd.in_jump = 0
+            end
+        elseif vz < -580 and dist > 9 then
+            cmd.in_jump = 1
+            cmd.in_duck = 0
+        end
+    end)
+end)
+
+-- No Sleeves (ported from Nyanza). Skips drawing any model part whose name
+-- contains "sleeve", so the arms render without the jacket sleeves.
+-- Lives in the Visuals group (aa_grp), not Misc.
+local ml_nosleeve = aa_grp:switch(menu_accent(ui.get_icon('shirt')) .. '  No Sleeves', false)
+
+events.draw_model:set(function(ctx)
+    if not ml_nosleeve:get() then return end
+    if entity.get_local_player() == nil then return end
+    local name = ctx.name
+    if name and name:match('sleeve') then return false end   -- hide the sleeve model
 end)
 
 -- ============================================================
@@ -999,11 +1146,12 @@ scout:refresh_list()
 -- ============================================================
 do
     local rage_items = { rage_soon }
-    local anim_items = { an_ground, an_air, an_bodylean }
+    local panim_items = { pa_interp, pa_lean, pa_fall, pa_walk }
     local misc_items = {
         nf_enabled, nf_color, nf_style,
         nf_icon, nf_time, nf_round, nf_brute, nf_types,
         aa_enabled,
+        ml_ladder, ml_nofall, ml_nosleeve,
     }
     local function set_vis(items, show)
         for _, it in ipairs(items or {}) do
@@ -1015,10 +1163,10 @@ do
         local idx = sel_index()
         if idx == last_idx then return end   -- only update on change
         last_idx = idx
-        -- 1 = Rage (coming soon); 2 = Misc (notifs + anti-aim + animations)
+        -- 1 = Rage (coming soon); 2 = Misc (notifs + anti-aim + player anims)
         set_vis(rage_items,  idx == 1)
         set_vis(misc_items,  idx == 2)
-        set_vis(anim_items,  idx == 2)
+        set_vis(panim_items, idx == 2)       -- Player Animations (Nyanza)
         set_vis(scout.items, idx == 3)       -- Scout config
     end
     events.render:set(apply_tabs)
