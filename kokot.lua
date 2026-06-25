@@ -53,6 +53,26 @@ end)
 -- Seed the RNG once so anti-brute [o:..:d:..] values differ between sessions.
 math.randomseed(globals.realtime * 1000 + globals.tickcount)
 
+-- ===== TEMP DEBUG (remove later) ============================================
+-- Surfaces hidden runtime errors -- e.g. an FFI call that fails only when the
+-- script is run through the louder interpreter. Run natively nothing throws,
+-- so nothing shows. dbg_pcall() works exactly like pcall() but records the
+-- last error, which is then drawn on-screen in red.
+local __DBG = nil
+local function dbg_pcall(fn)
+    local ok, err = pcall(fn)
+    if not ok then __DBG = tostring(err) end
+    return ok
+end
+events.render:set(function()
+    if __DBG then
+        pcall(function()
+            render.text(1, vector(15, 60), color(255, 70, 70, 255), nil, 'ANIM ERR: ' .. __DBG)
+        end)
+    end
+end)
+-- ===========================================================================
+
 local function lerp(a, b, t) return a + (b - a) * t end
 
 local hitgroups = {
@@ -746,7 +766,7 @@ events.post_update_clientside_animation:set(function()
     local lp = entity.get_local_player()
     if not lp or not lp:is_alive() then return end
 
-    pcall(function()
+    dbg_pcall(function()
         local cls = an_ffi.cast(an.class_ptr, an.get_entity_address(lp:get_index()))
         if cls == an.nullptr then return end
         local layers = an_ffi.cast(an.animation_layer_t, an_ffi.cast(an.char_ptr, cls) + 10640)[0]
